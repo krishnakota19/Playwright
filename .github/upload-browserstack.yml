@@ -1,0 +1,113 @@
+name: Upload BrowserStack Results
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Test environment (sit, qa, uat)'
+        required: false
+        default: 'sit'
+        type: string
+      test_type:
+        description: 'Test type label (Sanity, Smoke, Regression)'
+        required: false
+        default: 'Sanity'
+        type: string
+      artifact_name:
+        description: 'Name of the artifact containing test results'
+        required: false
+        default: 'test-results'
+        type: string
+      report_path:
+        description: 'Path to junit report after artifact download'
+        required: false
+        default: './test-results/junit-report.xml'
+        type: string
+      project_name:
+        description: 'BrowserStack project name'
+        required: false
+        default: 'project-name'
+        type: string
+      bs_upload:
+        description: 'Enable BrowserStack upload (mirrors BS_UPLOAD from .env.<environment>)'
+        required: false
+        default: 'false'
+        type: string
+    secrets:
+      BROWSERSTACK_USERNAME:
+        required: false
+      BROWSERSTACK_ACCESS_KEY:
+        required: false
+    outputs:
+      browserstack_url:
+        description: 'BrowserStack build URL extracted from upload logs'
+        value: ${{ jobs.upload.outputs.browserstack_url }}
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    outputs:
+      browserstack_url: ${{ steps.upload_to_browserstack.outputs.browserstack_url }}
+    steps:
+      - name: Download test results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: test-results
+        continue-on-error: true
+
+      - name: Upload JUnit report to BrowserStack
+        id: upload_to_browserstack
+        env:
+          TEST_TYPE: ${{ inputs.test_type }}
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+        run: |
+          # Skip upload if BS_UPLOAD is not enabled for this environment
+          if [ "${{ inputs.bs_upload }}" != "true" ]; then
+            echo "BrowserStack upload is disabled (bs_upload=${{ inputs.bs_upload }}). Skipping."
+            echo "browserstack_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "${BROWSERSTACK_USERNAME}" ] || [ -z "${BROWSERSTACK_ACCESS_KEY}" ]; then
+            echo "BrowserStack credentials are missing. Skipping BrowserStack upload."
+            echo "browserstack_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          REPORT="${{ inputs.report_path }}"
+          if [ ! -f "$REPORT" ]; then
+            echo "junit-report.xml not found at ${REPORT}. Artifact may not have been produced. Skipping BrowserStack upload."
+            echo "browserstack_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extract Playwright version from JUnit report if available, else default
+          PW_VERSION=$(grep -oPm1 'playwright-version="\K[^"]+' "$REPORT" 2>/dev/null || echo "1.57.0")
+          FRAMEWORK_VERSION="playwright,${PW_VERSION}"
+          echo "Using frameworkVersion: ${FRAMEWORK_VERSION}"
+
+          BUILD_NAME="Automated ${TEST_TYPE} Test - $(date +'%Y-%m-%d')"
+          BUILD_IDENTIFIER="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          CI_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          RESPONSE=$(curl -sS -u "${BROWSERSTACK_USERNAME}:${BROWSERSTACK_ACCESS_KEY}" -X POST \
+            -F "data=@${REPORT}" \
+            -F "projectName=${{ inputs.project_name }}" \
+            -F "buildName=${BUILD_NAME}" \
+            -F "buildIdentifier=${BUILD_IDENTIFIER}" \
+            -F "tags=playwright,automation,${{ inputs.environment }}" \
+            -F "ci=${CI_URL}" \
+            -F "frameworkVersion=${FRAMEWORK_VERSION}" \
+            "https://upload-automation.browserstack.com/upload")
+
+          echo "BrowserStack response: ${RESPONSE}"
+          BROWSERSTACK_URL=$(printf '%s' "$RESPONSE" | grep -Eo 'https://automation\.browserstack\.com/builds/[A-Za-z0-9]+' | head -1 || true)
+          echo "browserstack_url=${BROWSERSTACK_URL}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$BROWSERSTACK_URL" ]; then
+            echo "BrowserStack URL: ${BROWSERSTACK_URL}"
+          else
+            echo "BrowserStack upload completed, but build URL was not detected in output."
+          fi

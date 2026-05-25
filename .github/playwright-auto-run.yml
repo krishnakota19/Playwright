@@ -1,0 +1,322 @@
+name: Playwright Tests - Automated Run
+
+run-name: >-
+  ${{ 
+    github.event_name == 'push' && 'Playwright Tests - Automated Sanity Run' ||
+    (github.event.schedule == '30 4 * * 1-4' && 'Playwright Tests - Automated Smoke Run') ||
+    (github.event.schedule == '30 8 * * 1-4' && 'Playwright Tests - Automated Regression Run') ||
+    (github.event.schedule == '30 4 * * 5' && 'Playwright Tests - Automated Full Suite Run') ||
+    'Playwright Tests - Automated Run'
+  }}
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # Smoke tests Monday to Thursday at 10 AM IST (4:30 AM UTC)
+    - cron: '30 4 * * 1-4'
+    # Regression tests Monday to Thursday at 2 PM IST (8:30 AM UTC)  
+    - cron: '30 8 * * 1-4'
+    # Full suite Friday at 10 AM IST (4:30 AM UTC)
+    - cron: '30 4 * * 5'
+          
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # Sanity tests job - runs without sharding (only 4 test cases)
+  execute_sanity_test:
+    name: "Sanity Tests (Post-Merge)"
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest-2-8
+    env:
+      NPM_AUTH_SECRET: ${{ secrets.ARTIFACTORY_TOKEN}}
+      TEST_TYPE: sanity
+      ENVIRONMENT: qa
+      BROWSER: chrome
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4    
+    
+    - name: npm token
+      run: |
+        echo "//artifactory-name/:_authToken=$NPM_AUTH_SECRET" > .npmrc
+        echo "email = krishnakota19" >> .npmrc
+        echo "always-auth = true" >> .npmrc
+        echo "registry=https://artifactory-url/" >> .npmrc
+
+    - uses: actions/setup-node@v4
+      with:
+          node-version: '22'
+          cache: 'npm'
+          
+    - name: Install dependencies
+      run: npm install
+
+    - name: Install Playwright Browsers
+      run: npx playwright install --with-deps
+
+    - name: Display Test Configuration
+      run: |
+        echo "🚀 Running Sanity Tests with the following configuration:"
+        echo "Test Type: $TEST_TYPE"
+        echo "Environment: $ENVIRONMENT"
+        echo "Browser: $BROWSER"
+        echo "Trigger: ${{ github.event_name }}"
+        echo "Branch: ${{ github.ref_name }}"
+        echo "Sharding: Disabled (only 4 test cases)"
+
+    - name: Run Sanity Tests
+      run: npm run test:qa:sanity
+      env:
+        TEST_ENV: ${{ env.ENVIRONMENT }}
+        BROWSER: ${{ env.BROWSER }}
+
+    # Sanity tests upload conditionally to BrowserStack based on environment configuration
+    - name: Upload Sanity Test Results to BrowserStack Test Observability
+      if: always()
+      run: npm run upload:browserstack:qa
+      env:
+        BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+        BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+        BUILD_NAME: "Sanity Tests - $(date +'%Y-%m-%d %H:%M')"
+
+    # Upload only Playwright HTML report - contains all test results, screenshots, and traces
+    - name: Upload Sanity Playwright Report
+      uses: actions/upload-artifact@v4
+      if: ${{ !cancelled() }}
+      with:
+        name: sanity-playwright-report
+        path: playwright-report/
+        retention-days: 30
+
+  # Other tests job - runs with sharding for larger test suites
+  execute_test:
+    name: >-
+      ${{ 
+        (github.event.schedule == '30 4 * * 1-4' && 'Smoke Tests (Scheduled)') ||
+        (github.event.schedule == '30 8 * * 1-4' && 'Regression Tests (Scheduled)') ||
+        (github.event.schedule == '30 4 * * 5' && 'Full Test Suite (Scheduled)') ||
+        'Scheduled Tests'
+      }}
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest-2-8
+    strategy:
+      fail-fast: false
+      matrix:
+        shardIndex: [1, 2, 3, 4]
+        shardTotal: [4]
+    env:
+      NPM_AUTH_SECRET: ${{ secrets.ARTIFACTORY_TOKEN}}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4    
+    
+    - name: npm token
+      run: |
+        echo "//artifactory-url/:_authToken=$NPM_AUTH_SECRET" > .npmrc
+        echo "email = krishnakota19" >> .npmrc
+        echo "always-auth = true" >> .npmrc
+        echo "registry=https://artifactory-url/" >> .npmrc
+
+    - uses: actions/setup-node@v4
+      with:
+          node-version: '22'
+          cache: 'npm'
+          
+    - name: Install dependencies
+      run: npm install
+
+    - name: Install Playwright Browsers
+      run: npx playwright install --with-deps
+
+    # Set test type for scheduled runs only (sanity is handled by separate job)
+    - name: Set test type for scheduled runs
+      run: |
+        if [ "${{ github.event.schedule }}" = "30 4 * * 1-4" ]; then
+          echo "TEST_TYPE=smoke" >> $GITHUB_ENV
+        elif [ "${{ github.event.schedule }}" = "30 8 * * 1-4" ]; then
+          echo "TEST_TYPE=regression" >> $GITHUB_ENV
+        elif [ "${{ github.event.schedule }}" = "30 4 * * 5" ]; then
+          echo "TEST_TYPE=full" >> $GITHUB_ENV
+        fi
+        echo "ENVIRONMENT=qa" >> $GITHUB_ENV
+        echo "BROWSER=chrome" >> $GITHUB_ENV
+
+    - name: Display Test Configuration
+      run: |
+        echo "🚀 Running Automated Tests with the following configuration:"
+        echo "Test Type: $TEST_TYPE"
+        echo "Environment: $ENVIRONMENT"
+        echo "Browser: $BROWSER"
+        echo "Trigger: ${{ github.event_name }}"
+        echo "Schedule: ${{ github.event.schedule }}"
+        echo "Sharding: ${{ matrix.shardIndex }}/${{ matrix.shardTotal }}"
+
+    - name: Run Smoke Tests
+      if: env.TEST_TYPE == 'smoke'
+      run: npm run test:qa:smoke -- --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+      env:
+        CI: true  # Ensure blob reports are generated
+        TEST_ENV: ${{ env.ENVIRONMENT }}
+        BROWSER: ${{ env.BROWSER }}
+
+    - name: Run Regression Tests
+      if: env.TEST_TYPE == 'regression'
+      run: npm run test:qa:reg -- --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+      env:
+        CI: true  # Ensure blob reports are generated
+        TEST_ENV: ${{ env.ENVIRONMENT }}
+        BROWSER: ${{ env.BROWSER }}
+
+    - name: Run Full Test Suite
+      if: env.TEST_TYPE == 'full'
+      run: npm run test:qa -- --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+      env:
+        CI: true  # Ensure blob reports are generated
+        TEST_ENV: ${{ env.ENVIRONMENT }}
+        BROWSER: ${{ env.BROWSER }}
+
+    # Archive shard artifacts for merging
+    - name: Archive shard artifacts
+      if: always()
+      run: |
+        mkdir -p junit-reports
+        
+        # Store JUnit report with shard identifier
+        if [ -f junit-test-report.xml ]; then
+          cp junit-test-report.xml "junit-reports/junit-shard-${{ matrix.shardIndex }}.xml"
+        else
+          echo '<?xml version="1.0" encoding="UTF-8"?><testsuites name="Shard ${{ matrix.shardIndex }}" tests="0" failures="0" errors="0"></testsuites>' > "junit-reports/junit-shard-${{ matrix.shardIndex }}.xml"
+        fi
+
+    # Upload blob report for final HTML report generation  
+    - name: Upload blob report to GitHub Actions Artifacts
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: blob-report-${{ matrix.shardIndex }}
+        path: playwright-blob-report
+        retention-days: 30
+        
+    # Upload JUnit report for BrowserStack consolidation
+    - name: Upload JUnit report
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: junit-report-${{ matrix.shardIndex }}
+        path: junit-reports/junit-shard-${{ matrix.shardIndex }}.xml
+        retention-days: 30
+        if-no-files-found: ignore
+
+  merge-reports:
+    name: "Generate Final HTML Report"
+    # Generate consolidated HTML report after all shards complete
+    # Only runs for scheduled tests that use sharding
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    needs: [execute_test]
+
+    runs-on: ubuntu-latest-2-8
+    env:
+      NPM_AUTH_SECRET: ${{ secrets.ARTIFACTORY_TOKEN }}
+      CI: true  # Ensure blob reports are generated
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+        
+    - name: npm token
+      run: |
+        echo "//artifactory.-url/:_authToken=$NPM_AUTH_SECRET" > .npmrc
+        echo "email = krishnakota19" >> .npmrc
+        echo "always-auth = true" >> .npmrc
+        echo "registry=https://artifactory-url/" >> .npmrc
+        
+    - name: Install dependencies
+      run: npm install
+
+    # Set test type for automated runs based on schedule
+    - name: Set test type for automated runs
+      run: |
+        if [ "${{ github.event.schedule }}" = "30 4 * * 1-4" ]; then
+          echo "TEST_TYPE=smoke" >> $GITHUB_ENV
+        elif [ "${{ github.event.schedule }}" = "30 8 * * 1-4" ]; then
+          echo "TEST_TYPE=regression" >> $GITHUB_ENV
+        elif [ "${{ github.event.schedule }}" = "30 4 * * 5" ]; then
+          echo "TEST_TYPE=full" >> $GITHUB_ENV
+        else
+          echo "TEST_TYPE=unknown" >> $GITHUB_ENV
+        fi
+        echo "ENVIRONMENT=qa" >> $GITHUB_ENV
+
+    - name: Download blob reports from GitHub Actions Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: all-blob-reports
+        pattern: blob-report-*
+        merge-multiple: true
+        
+    - name: Download JUnit reports for merging
+      uses: actions/download-artifact@v4
+      with:
+        path: junit-reports
+        pattern: junit-report-*
+        merge-multiple: true
+
+
+    - name: Check if blob reports exist
+      run: |
+        if [ ! -d "all-blob-reports" ] || [ -z "$(ls -A all-blob-reports)" ]; then
+          echo "⚠️ No blob reports found to merge"
+        else
+          echo "✅ Found blob reports to merge:"
+          ls -la all-blob-reports/
+        fi
+
+    - name: Merge into HTML Report
+      run: |
+        if [ -d "all-blob-reports" ] && [ "$(ls -A all-blob-reports)" ]; then
+          echo "🔄 Merging blob reports into HTML report..."
+          npx playwright merge-reports --reporter html ./all-blob-reports
+          echo "✅ HTML report generated successfully"
+        else
+          echo "⚠️ No blob reports to merge, skipping HTML report generation"
+        fi
+        
+        # Merge JUnit reports if they exist
+        if ls junit-reports/*.xml 1> /dev/null 2>&1; then
+          npm run merge:junit
+        fi
+
+    # Upload consolidated results to BrowserStack
+    - name: Upload Consolidated Results to BrowserStack Test Observability
+      if: always()
+      run: |
+        if [ -f merged-junit-test-report.xml ]; then
+          BUILD_NAME="Automated ${{ env.TEST_TYPE }} Test - $(date +'%Y-%m-%d %H:%M')"
+          npx ts-node scripts/browserstack-upload.ts upload merged-junit-test-report.xml DRLFI_CS_Playwright "$BUILD_NAME" ${{ env.ENVIRONMENT }}
+        fi
+      env:
+        BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+        BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+
+    # Upload the final merged HTML report
+    - name: Upload Final Merged HTML Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: final-html-report
+        path: playwright-report
+        retention-days: 30
+        
+    # Upload merged JUnit report for BrowserStack
+    - name: Upload Merged JUnit Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: merged-junit-report
+        path: merged-junit-test-report.xml
+        retention-days: 30
+        if-no-files-found: ignore

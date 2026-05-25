@@ -1,0 +1,184 @@
+name: Playwright Automated Run
+run-name: >-
+  Playwright
+  ${{ github.event_name == 'workflow_dispatch' && 'Manual' || 'Automated' }}
+  -
+  ${{ (github.event_name == 'workflow_dispatch' && inputs.application) ||
+      ((github.event.schedule == '5 5 * * 1-4' || github.event.schedule == '5 5 * * 5') && 'OAO') ||
+      'Consumer OLB' }}
+  ${{ github.event_name == 'push' && 'Sanity' ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 4 * * 1-4' && 'Smoke') ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 4 * * 5' && 'Regression') ||
+      (github.event_name == 'schedule' && github.event.schedule == '5 5 * * 1-4' && 'Smoke') ||
+      (github.event_name == 'schedule' && github.event.schedule == '5 5 * * 5' && 'Regression') ||
+      (github.event_name == 'workflow_dispatch' && inputs.test_type == 'sanity' && 'Sanity') ||
+      (github.event_name == 'workflow_dispatch' && inputs.test_type == 'smoke' && 'Smoke') ||
+      (github.event_name == 'workflow_dispatch' && inputs.test_type == 'regression' && 'Regression') ||
+      'Smoke' }}
+  Tests
+   
+
+on:
+  push:
+    branches: [main]
+  # Cron job for Smoke tests - Monday to Thursday at 10 AM IST (4:30 AM UTC)
+  schedule:
+    - cron: '30 4 * * 1-4'  # Consumer Monday-Thursday at 4:30 AM UTC (10:00 AM IST)
+    - cron: '30 4 * * 5'    # dConsumer Friday at 4:30 AM UTC (10:00 AM IST)
+    # - cron: '5 5 * * 1-4'   # OAO Monday-Thursday at 5:05 AM UTC (10:35 AM IST) — PAUSED
+    # - cron: '5 5 * * 5'     # OAO Friday at 5:05 AM UTC (10:35 AM IST) — PAUSED
+  # Allow manual triggering of the workflow from the GitHub Actions interface customize as per your requirement
+  workflow_dispatch:
+    inputs:
+      repo_name:
+        description: 'Repository name'
+        required: true
+        default: 'Project Name'
+        type: string
+      environment:
+        description: 'Test environment'
+        required: true
+        type: choice
+        options:
+          - sit
+          - qa
+          - uat
+        default: 'sit'     
+      branch:
+        description: 'Branch name'
+        default: 'main'
+        type: string
+      test_type:
+        description: 'Test type to run'
+        required: false
+        type: choice
+        options:
+          - sanity
+          - smoke
+          - regression
+        default: 'smoke'
+      browser:
+        description: 'Browser to test'
+        required: true
+        type: choice
+        options:
+          - chrome
+          - firefox
+          - edge
+          - webkit
+        default: 'chrome'
+      application:
+        description: 'Application name'
+        required: true
+        type: choice
+        options:
+          - Consumer OLB
+          - OAO
+        default: 'Consumer OLB'
+      project:
+        description: 'Playwright project to run'
+        required: false
+        type: choice
+        options:
+          - Consumer
+          - OAO
+        default: 'Consumer'
+      email:
+        description: 'Notification recipient GitHub username(s), comma-separated'
+        required: false
+        default: 'krishnakota19'
+        type: string
+      
+
+jobs:
+  call-playwright-qa:
+    uses: playwright-qa.yml@main
+    with:
+      repo-name: ${{ github.event_name == 'workflow_dispatch' && inputs.repo_name || 'Project_Repo' }}
+      branch: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || 'main' }}
+      npm-registry: 'npm-artifactory-name'
+      report-name: 'playwright-report'
+      # Dynamic event-type based on trigger
+      # - Push: Run sanity tests
+      # - Schedule Monday-Thursday: Run smoke tests
+      # - Schedule Friday: Run regression tests
+      # - Manual: Use input parameter
+      event-type: ${{ github.event_name == 'push' && '@sanity' || (github.event_name == 'schedule' && (github.event.schedule == '30 4 * * 1-4' || github.event.schedule == '5 5 * * 1-4') && '@smoke') || (github.event_name == 'schedule' && (github.event.schedule == '30 4 * * 5' || github.event.schedule == '5 5 * * 5') && '@regression') || (github.event_name == 'workflow_dispatch' && inputs.test_type && format('@{0}', inputs.test_type)) || '@smoke' }}
+      # Project is passed separately and consumed as --project in reusable workflow
+      project: ${{ (github.event_name == 'workflow_dispatch' && inputs.project != '' && inputs.project) || (github.event.schedule == '5 5 * * 1-4' && 'OAO') || (github.event.schedule == '5 5 * * 5' && 'OAO') || 'Consumer' }}
+      screenshots-name: ${{ format('screenshots-{0}', github.event_name == 'workflow_dispatch' && inputs.browser || 'chrome') }}
+      test-results-dir: 'test-results'
+      screenshots-dir: 'screenshots/'
+    secrets:
+      VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+
+  upload_browserstack_results:
+    needs: call-playwright-qa
+    if: ${{ always() }}
+    uses: ./.github/workflows/upload-browserstack-results.yml
+    with:
+      environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'sit' }}
+      test_type: ${{ github.event_name == 'push' && 'Sanity' || (github.event_name == 'schedule' && (github.event.schedule == '30 4 * * 1-4' || github.event.schedule == '5 5 * * 1-4') && 'Smoke') || (github.event_name == 'schedule' && (github.event.schedule == '30 4 * * 5' || github.event.schedule == '5 5 * * 5') && 'Regression') || (github.event_name == 'workflow_dispatch' && inputs.test_type == 'sanity' && 'Sanity') || (github.event_name == 'workflow_dispatch' && inputs.test_type == 'smoke' && 'Smoke') || (github.event_name == 'workflow_dispatch' && inputs.test_type == 'regression' && 'Regression') || 'Smoke' }}
+      artifact_name: smoke-test-results
+      report_path: ./test-results/junit-report.xml
+      project_name: dlfi-impl_mfbstage1playwright
+      # BS_UPLOAD toggle — keep in sync with config/.env.<environment> files
+      # Currently: sit=true, qa=false, uat=false
+      bs_upload: ${{ (github.event_name == 'workflow_dispatch' && inputs.environment || 'sit') == 'sit' && 'true' || 'false' }}
+    secrets:
+      BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+      BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+
+  # AI Failure Analyzer — runs after tests, generates categorized root-cause HTML report
+  ai_failure_analysis:
+    needs: call-playwright-qa
+    if: always()
+    uses: ./.github/workflows/ai-failure-analysis.yml
+    with:
+      artifact_name: 'smoke-test-results'
+      results_file: 'test-results/results.json'
+      retention_days: '3'    
+        
+  # Parses the Playwright JSON report → HTML table with execution summary & pass/fail counts
+  parse_results:
+    needs: call-playwright-qa
+    if: always()
+    uses: ./.github/workflows/parse-results.yml
+    with:
+      artifact_name: 'smoke-test-results'
+      # Dynamic test_type matching the event-type logic above
+      test_type: >-
+        ${{ github.event_name == 'push' && 'Sanity' ||
+        (github.event_name == 'schedule' && (github.event.schedule == '30 4 * * 1-4' || github.event.schedule == '5 5 * * 1-4') && 'Smoke') ||
+        (github.event_name == 'schedule' && (github.event.schedule == '30 4 * * 5' || github.event.schedule == '5 5 * * 5') && 'Regression') ||
+            (github.event_name == 'workflow_dispatch' && inputs.test_type == 'sanity' && 'Sanity') ||
+            (github.event_name == 'workflow_dispatch' && inputs.test_type == 'smoke' && 'Smoke') ||
+            (github.event_name == 'workflow_dispatch' && inputs.test_type == 'regression' && 'Regression') ||
+            'Smoke' }}
+      browser: ${{ github.event_name == 'workflow_dispatch' && inputs.browser || 'chrome' }}
+      environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'sit' }}
+      application: ${{ (github.event_name == 'workflow_dispatch' && inputs.application) || ((github.event.schedule == '5 5 * * 1-4' || github.event.schedule == '5 5 * * 5') && 'OAO') || 'Consumer OLB' }}
+      trigger: ${{ github.event_name == 'workflow_dispatch' && 'Manual' || (github.event_name == 'schedule' && 'Scheduled') || 'Automated' }}
+
+  send_notification:
+    needs: [call-playwright-qa, upload_browserstack_results, parse_results, ai_failure_analysis]
+    if: ${{ always() && (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.email != '')) }}
+    runs-on: ubuntu-latest-2-8
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+    steps:
+      - name: Send Email with Artifacts
+        uses: mail-actions
+        with:
+          team: ${{ github.event_name == 'push' && 'krishnakota19' || (github.event_name == 'workflow_dispatch' && inputs.email) || 'krishnakota19' }}
+          artifact_names: 'playwright-report,ai-failure-analysis'
+          message: |
+            <br>
+            ${{ needs.parse_results.outputs.test_summary }}
+            ${{ needs.ai_failure_analysis.outputs.failure_table }}
+            <b>Playwright Report Artifacts:</b> https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}  
+            <br>
+            <b>BrowserStack Results:</b> ${{ needs.upload_browserstack_results.result == 'success' && needs.upload_browserstack_results.outputs.browserstack_url != '' && needs.upload_browserstack_results.outputs.browserstack_url || 'N/A' }}
+  

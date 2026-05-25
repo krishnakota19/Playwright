@@ -1,0 +1,72 @@
+# Reusable workflow — Posts an Adaptive Card to a Microsoft Teams channel via webhook.
+# Called by other workflows after test execution to relay the notification message.
+name: Teams Notification
+
+on:
+  workflow_call:
+    inputs:
+      message:
+        description: 'HTML/text message body to post (e.g. email_body from panda action)'
+        required: true
+        type: string
+      run_url:
+        description: 'URL to the GitHub Actions run'
+        required: true
+        type: string
+    secrets:
+      TEAMS_WEBHOOK_URL:
+        description: 'Microsoft Teams incoming-webhook URL'
+        required: true
+
+jobs:
+  post_to_teams:
+    runs-on: ubuntu-latest-2-8
+    steps:
+      - name: Post Adaptive Card to Teams
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          MSG: ${{ inputs.message }}
+          RUN_URL: ${{ inputs.run_url }}
+        run: |
+          curl -sS -H "Content-Type: application/json" -d "$(python3 - << 'PY'
+          import json, os, html
+
+          msg  = os.environ.get("MSG", "")
+          run_url = os.environ.get("RUN_URL", "")
+
+          payload = {
+              "type": "message",
+              "attachments": [
+                  {
+                      "contentType": "application/vnd.microsoft.card.adaptive",
+                      "content": {
+                          "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                          "type": "AdaptiveCard",
+                          "version": "1.4",
+                          "body": [
+                              {
+                                  "type": "TextBlock",
+                                  "text": "Automation Notification",
+                                  "size": "Large",
+                                  "weight": "Bolder"
+                              },
+                              {
+                                  "type": "TextBlock",
+                                  "text": msg or "(no message)",
+                                  "wrap": True
+                              }
+                          ],
+                          "actions": [
+                              {
+                                  "type": "Action.OpenUrl",
+                                  "title": "View GitHub Run",
+                                  "url": run_url
+                              }
+                          ]
+                      }
+                  }
+              ]
+          }
+          print(json.dumps(payload))
+          PY
+          )" "$TEAMS_WEBHOOK_URL"

@@ -1,0 +1,312 @@
+name: Playwright Tests - Manual Run
+
+run-name: >-
+  ${{ 
+    (github.event.inputs.test_type == 'sanity' && 'Playwright Tests - Manual Sanity Tests') ||
+    (github.event.inputs.test_type == 'smoke' && 'Playwright Tests - Manual Smoke Tests') ||
+    (github.event.inputs.test_type == 'regression' && 'Playwright Tests - Manual Regression Tests') ||
+    (github.event.inputs.test_type == 'full' && 'Playwright Tests - Manual Full Test Suite') ||
+    'Playwright Tests - Manual Run'
+  }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Test environment'
+        required: true
+        default: 'qa'
+        type: choice
+        options:
+          - qa
+      test_type:
+        description: 'Test type'
+        required: true
+        default: 'sanity'
+        type: choice
+        options:
+          - sanity
+          - smoke
+          - regression
+          - full
+      browser:
+        description: 'Browser to test'
+        required: true
+        default: 'chrome'
+        type: choice
+        options:
+          - chrome
+          
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # Sanity tests job - runs without sharding (only 4 test cases)
+  execute_sanity_test:
+    name: "Sanity Tests (Manual Run)"
+    if: github.event.inputs.test_type == 'sanity'
+    runs-on: ubuntu-latest-2-8
+    env:
+      NPM_AUTH_SECRET: ${{ secrets.ARTIFACTORY_TOKEN}}
+      TEST_TYPE: ${{ github.event.inputs.test_type }}
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+      BROWSER: ${{ github.event.inputs.browser }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4    
+    
+    - name: npm token
+      run: |
+        echo "//artifactory.url" > .npmrc
+        echo "email = krishnakota19" >> .npmrc
+        echo "always-auth = true" >> .npmrc
+        echo "registry=https://artifactory-url" >> .npmrc
+
+    - uses: actions/setup-node@v4
+      with:
+          node-version: '22'
+          cache: 'npm'
+          
+    - name: Install dependencies
+      run: npm install
+
+    - name: Install Playwright Browsers
+      run: npx playwright install --with-deps
+
+    - name: Display Test Configuration
+      run: |
+        echo "🚀 Running Manual Sanity Tests with the following configuration:"
+        echo "Test Type: $TEST_TYPE"
+        echo "Environment: $ENVIRONMENT"
+        echo "Browser: $BROWSER"
+        echo "Trigger: Manual Dispatch"
+        echo "Sharding: Disabled (only 4 test cases)"
+
+    - name: Run Sanity Tests
+      run: npm run test:qa:sanity
+      env:
+        TEST_ENV: ${{ env.ENVIRONMENT }}
+        BROWSER: ${{ env.BROWSER }}
+
+    # Sanity tests upload directly to BrowserStack (no sharding, only 4 tests)
+    - name: Upload Sanity Test Results to BrowserStack Test Observability
+      if: always()
+      run: npm run upload:browserstack:qa
+      env:
+        BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+        BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+        BUILD_NAME: "Manual Sanity Tests - $(date +'%Y-%m-%d %H:%M')"
+
+    
+
+    # Upload both HTML and XML reports for consistency
+    - name: Upload Sanity Reports
+      uses: actions/upload-artifact@v4
+      if: ${{ !cancelled() }}
+      with:
+        name: sanity-playwright-report
+        path: playwright-report/
+        retention-days: 30
+
+
+  # Other tests job - runs with sharding for larger test suites
+  execute_test:
+    name: >-
+      ${{ 
+        (github.event.inputs.test_type == 'smoke' && 'Smoke Tests (Manual Run)') ||
+        (github.event.inputs.test_type == 'regression' && 'Regression Tests (Manual Run)') ||
+        (github.event.inputs.test_type == 'full' && 'Full Test Suite (Manual Run)') ||
+        'Manual Tests'
+      }}
+    if: github.event.inputs.test_type != 'sanity'
+    runs-on: ubuntu-latest-2-8
+    strategy:
+      fail-fast: false
+      matrix:
+        shardIndex: [1, 2, 3, 4]
+        shardTotal: [4]
+    env:
+      NPM_AUTH_SECRET: ${{ secrets.ARTIFACTORY_TOKEN}}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4    
+    
+    - name: npm token
+      run: |
+        echo "//artifactory.url" > .npmrc
+        echo "email = krishnakota19" >> .npmrc
+        echo "always-auth = true" >> .npmrc
+        echo "registry=https://artifactory.url" >> .npmrc
+
+    - uses: actions/setup-node@v4
+      with:
+          node-version: '22'
+          cache: 'npm'
+          
+    - name: Install dependencies
+      run: npm install
+
+    - name: Install Playwright Browsers
+      run: npx playwright install --with-deps
+
+    # Set test type for manual runs
+    - name: Set test type for manual runs
+      run: |
+        echo "TEST_TYPE=${{ github.event.inputs.test_type }}" >> $GITHUB_ENV
+        echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+        echo "BROWSER=${{ github.event.inputs.browser }}" >> $GITHUB_ENV
+
+    - name: Display Test Configuration
+      run: |
+        echo "🚀 Running Manual Tests with the following configuration:"
+        echo "Test Type: $TEST_TYPE"
+        echo "Environment: $ENVIRONMENT"
+        echo "Browser: $BROWSER"
+        echo "Trigger: Manual Dispatch"
+
+    - name: Run Smoke Tests
+      if: env.TEST_TYPE == 'smoke'
+      run: npm run test:qa:smoke -- --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+      env:
+        CI: true  # Ensure blob reports are generated
+        TEST_ENV: ${{ env.ENVIRONMENT }}
+        BROWSER: ${{ env.BROWSER }}
+
+    - name: Run Regression Tests
+      if: env.TEST_TYPE == 'regression'
+      run: npm run test:qa:reg -- --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+      env:
+        CI: true  # Ensure blob reports are generated
+        TEST_ENV: ${{ env.ENVIRONMENT }}
+        BROWSER: ${{ env.BROWSER }}
+
+    - name: Run Full Test Suite
+      if: env.TEST_TYPE == 'full'
+      run: npm run test:qa -- --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+      env:
+        CI: true  # Ensure blob reports are generated
+        TEST_ENV: ${{ env.ENVIRONMENT }}
+        BROWSER: ${{ env.BROWSER }}
+
+    # Archive JUnit report for BrowserStack upload
+    - name: Archive JUnit report
+      if: always()
+      run: |
+        if [ -f junit-test-report.xml ]; then
+          cp junit-test-report.xml "junit-shard-${{ matrix.shardIndex }}.xml"
+        fi
+
+    # Upload blob report for final HTML report generation  
+    - name: Upload blob report to GitHub Actions Artifacts
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: blob-report-${{ matrix.shardIndex }}
+        path: playwright-blob-report
+        retention-days: 30
+        
+    # Upload JUnit report for BrowserStack consolidation
+    - name: Upload JUnit report
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: junit-report-${{ matrix.shardIndex }}
+        path: junit-shard-${{ matrix.shardIndex }}.xml
+        retention-days: 30
+        if-no-files-found: ignore
+
+  merge-reports:
+    name: "Generate Final HTML Report"
+    # Generate consolidated HTML report after all shards complete
+    # Only runs for non-sanity tests that use sharding
+    if: ${{ !cancelled() && github.event.inputs.test_type != 'sanity' }}
+    needs: [execute_test]
+
+    runs-on: ubuntu-latest-2-8
+    env:
+      NPM_AUTH_SECRET: ${{ secrets.ARTIFACTORY_TOKEN }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+        
+    - name: npm token
+      run: |
+        echo "//artifactory.url" > .npmrc
+        echo "email = krishnakota19" >> .npmrc
+        echo "always-auth = true" >> .npmrc
+        echo "registry=https://artifactory.url" >> .npmrc
+        
+    - name: Install dependencies
+      run: npm install
+
+    - name: Download blob reports from GitHub Actions Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: all-blob-reports
+        pattern: blob-report-*
+        merge-multiple: true
+        
+    - name: Download JUnit reports for merging
+      uses: actions/download-artifact@v4
+      with:
+        path: junit-reports
+        pattern: junit-report-*
+        merge-multiple: true
+
+    - name: Check if blob reports exist
+      run: |
+        if [ ! -d "all-blob-reports" ] || [ -z "$(ls -A all-blob-reports)" ]; then
+          echo "⚠️ No blob reports found to merge"
+        else
+          echo "✅ Found blob reports to merge:"
+          ls -la all-blob-reports/
+        fi
+
+    - name: Merge into HTML Report
+      run: |
+        if [ -d "all-blob-reports" ] && [ "$(ls -A all-blob-reports)" ]; then
+          echo "🔄 Merging blob reports into HTML report..."
+          npx playwright merge-reports --reporter html ./all-blob-reports
+          echo "✅ HTML report generated successfully"
+        else
+          echo "⚠️ No blob reports to merge, skipping HTML report generation"
+        fi
+        
+        # Merge JUnit reports if they exist
+        if ls junit-reports/*.xml 1> /dev/null 2>&1; then
+          npm run merge:junit
+        fi
+
+    # Upload consolidated results to BrowserStack
+    - name: Upload to BrowserStack
+      if: always()
+      run: |
+        if [ -f merged-junit-test-report.xml ]; then
+          BUILD_NAME="Manual ${{ env.TEST_TYPE }} Test - $(date +'%Y-%m-%d %H:%M')"
+          npx ts-node scripts/browserstack-upload.ts upload merged-junit-test-report.xml DRLFI_CS_Playwright "$BUILD_NAME" ${{ env.ENVIRONMENT }}
+        fi
+      env:
+        BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+        BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+        BUILD_NAME: "Manual ${{ github.event.inputs.test_type }} Tests - $(date +'%Y-%m-%d %H:%M')"
+
+    # Upload the final merged HTML report
+    - name: Upload Final Merged HTML Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: final-html-report
+        path: playwright-report
+        retention-days: 30
+        
+    # Upload merged JUnit report for BrowserStack
+    - name: Upload Merged JUnit Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: merged-junit-report
+        path: merged-junit-test-report.xml
+        retention-days: 30

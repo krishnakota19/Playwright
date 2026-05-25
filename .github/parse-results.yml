@@ -1,0 +1,199 @@
+name: Parse Playwright Results
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: 'Name of the test-results artifact to download'
+        required: false
+        default: 'test-results'
+        type: string
+      test_type:
+        description: 'Test type label (e.g. Sanity, Smoke, Regression)'
+        required: false
+        default: 'Sanity'
+        type: string
+      browser:
+        description: 'Browser used for the test run'
+        required: false
+        default: 'chrome'
+        type: string
+      environment:
+        description: 'Test environment (sit, qa, uat)'
+        required: false
+        default: 'sit'
+        type: string
+      application:
+        description: 'Application name (e.g. Consumer OLB, OAO)'
+        required: false
+        default: 'Consumer OLB'
+        type: string
+      trigger:
+        description: 'How the run was triggered (Manual or Automated)'
+        required: false
+        default: 'Automated'
+        type: string
+    outputs:
+      test_summary:
+        description: 'HTML table with execution summary and pass/fail counts'
+        value: ${{ jobs.parse.outputs.test_summary }}
+      total:
+        description: 'Total test count'
+        value: ${{ jobs.parse.outputs.total }}
+      passed:
+        description: 'Passed test count'
+        value: ${{ jobs.parse.outputs.passed }}
+      failed:
+        description: 'Failed test count'
+        value: ${{ jobs.parse.outputs.failed }}
+      flaky:
+        description: 'Flaky test count'
+        value: ${{ jobs.parse.outputs.flaky }}
+      skipped:
+        description: 'Skipped test count'
+        value: ${{ jobs.parse.outputs.skipped }}
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    outputs:
+      test_summary: ${{ steps.parse.outputs.summary }}
+      total: ${{ steps.parse.outputs.total }}
+      passed: ${{ steps.parse.outputs.passed }}
+      failed: ${{ steps.parse.outputs.failed }}
+      flaky: ${{ steps.parse.outputs.flaky }}
+      skipped: ${{ steps.parse.outputs.skipped }}
+    steps:
+      - name: Download test results artifact (by name)
+        id: download_named
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: test-results
+        continue-on-error: true
+
+      - name: Fallback - download all artifacts
+        if: steps.download_named.outcome == 'failure'
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+        continue-on-error: true
+
+      - name: List downloaded files (debug)
+        run: |
+          echo "=== Contents of test-results/ ==="
+          find test-results -type f 2>/dev/null || echo "test-results directory not found"
+          echo "=== Contents of all-artifacts/ ==="
+          find all-artifacts -type f -name '*.json' 2>/dev/null || echo "No JSON files in all-artifacts"
+          echo "=== Looking for results.json anywhere ==="
+          find . -name 'results.json' -type f 2>/dev/null || echo "No results.json found anywhere"
+        continue-on-error: true
+
+      # ─────────────────────────────────────────────────────────────
+      # Parse results.json and build an HTML summary table
+      # ─────────────────────────────────────────────────────────────
+      - name: Parse Playwright JSON results
+        id: parse
+        run: |
+          # --- Collect workflow inputs into variables ---
+          TEST_TYPE="${{ inputs.test_type }}"
+          BROWSER="${{ inputs.browser }}"
+          ENVIRONMENT="${{ inputs.environment }}"
+          APPLICATION="${{ inputs.application }}"
+          TRIGGER="${{ inputs.trigger }}"
+
+          # --- Locate results.json (checks multiple fallback paths) ---
+          RESULTS_FILE=""
+          for candidate in \
+            "test-results/results.json" \
+            "test-results/test-results/results.json" \
+            "$(find test-results -name 'results.json' -type f 2>/dev/null | head -1)" \
+            "$(find all-artifacts -name 'results.json' -type f 2>/dev/null | head -1)"; do
+            if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+              RESULTS_FILE="$candidate"
+              break
+            fi
+          done
+
+          # ── PATH A: results.json found → extract stats ──
+          if [ -n "$RESULTS_FILE" ]; then
+            echo "Found results at: ${RESULTS_FILE}"
+
+            # Extract test counts from Playwright JSON stats
+            PASSED=$(jq '.stats.expected // 0' "$RESULTS_FILE")
+            FAILED=$(jq '.stats.unexpected // 0' "$RESULTS_FILE")
+            FLAKY=$(jq '.stats.flaky // 0' "$RESULTS_FILE")
+            SKIPPED=$(jq '.stats.skipped // 0' "$RESULTS_FILE")
+
+            # Calculate execution duration (duration is in milliseconds)
+            DURATION_MS=$(jq -r '.stats.duration // 0 | floor' "$RESULTS_FILE")
+            HOURS=$((DURATION_MS / 3600000))
+            MINUTES=$(((DURATION_MS % 3600000) / 60000))
+            SECONDS=$(((DURATION_MS % 60000) / 1000))
+            DURATION=$(printf "%02d:%02d:%02d" "$HOURS" "$MINUTES" "$SECONDS")
+            TOTAL=$((PASSED + FAILED + FLAKY + SKIPPED))
+            echo "total=${TOTAL}" >> $GITHUB_OUTPUT
+            echo "passed=${PASSED}" >> $GITHUB_OUTPUT
+            echo "failed=${FAILED}" >> $GITHUB_OUTPUT
+            echo "flaky=${FLAKY}" >> $GITHUB_OUTPUT
+            echo "skipped=${SKIPPED}" >> $GITHUB_OUTPUT
+
+            # Determine overall status
+            if [ "$FAILED" = "0" ]; then
+              OVERALL_STATUS="✅ All Tests Passed"
+            else
+              OVERALL_STATUS="❌ Some Tests Failed"
+            fi
+            RUN_DATE=$(date +'%d %b %Y')
+
+            # Build HTML summary table for email notification
+            {
+              echo 'summary<<EOF'
+              echo "<b>Automated Test Execution Summary — ${APPLICATION}</b><br><b>Date:</b> ${RUN_DATE}<br><b>Overall Status:</b> ${OVERALL_STATUS}<br><br>"
+              echo '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:14px;">'
+              echo "  <tr style=\"background-color:#4472C4;color:#ffffff;\"><th colspan=\"2\">Execution Summary</th></tr>"
+              echo "  <tr><td><b>Application:</b></td><td>${APPLICATION}</td></tr>"
+              echo "  <tr><td><b>Test Type:</b></td><td>${TEST_TYPE}</td></tr>"
+              echo "  <tr><td><b>Browser:</b></td><td>${BROWSER}</td></tr>"
+              echo "  <tr><td><b>Environment:</b></td><td>${ENVIRONMENT}</td></tr>"
+              echo "  <tr><td><b>Trigger:</b></td><td>${TRIGGER}</td></tr>"
+              echo "  <tr><td><b>Execution Duration:</b></td><td>${DURATION}</td></tr>"
+              echo '  <tr><td colspan="2">&nbsp;</td></tr>'
+              echo "  <tr style=\"background-color:#4472C4;color:#ffffff;\"><th colspan=\"2\">Test Results</th></tr>"
+              echo "  <tr><td><b>Total</b></td><td>${TOTAL}</td></tr>"
+              echo "  <tr><td><b>Passed ✅</b></td><td style=\"color:green;\">${PASSED}</td></tr>"
+              echo "  <tr><td><b>Failed ❌</b></td><td style=\"color:red;\">${FAILED}</td></tr>"
+              echo "  <tr><td><b>Flaky ⚠️</b></td><td style=\"color:orange;\">${FLAKY}</td></tr>"
+              echo "  <tr><td><b>Skipped ⏭️</b></td><td style=\"color:gray;\">${SKIPPED}</td></tr>"
+              echo '  <tr><td colspan="2">&nbsp;</td></tr>'
+              echo '</table>'
+              echo 'EOF'
+            } >> $GITHUB_OUTPUT
+
+          # ── PATH B: results.json NOT found → show "unavailable" ──
+          else
+            RUN_DATE=$(date +'%d %b %Y')
+            {
+              echo 'summary<<EOF'
+              echo "<b>Automated Test Execution Summary — ${APPLICATION}</b><br><b>Date:</b> ${RUN_DATE}<br><b>Overall Status:</b> ❌ Results Unavailable<br><br>"
+              echo '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:14px;">'
+              echo "  <tr style=\"background-color:#4472C4;color:#ffffff;\"><th colspan=\"2\">Execution Summary</th></tr>"
+              echo "  <tr><td><b>Test Type:</b></td><td>${TEST_TYPE}</td></tr>"
+              echo "  <tr><td><b>Application:</b></td><td>${APPLICATION}</td></tr>"
+              echo "  <tr><td><b>Browser:</b></td><td>${BROWSER}</td></tr>"
+              echo "  <tr><td><b>Environment:</b></td><td>${ENVIRONMENT}</td></tr>"
+              echo "  <tr><td><b>Trigger:</b></td><td>${TRIGGER}</td></tr>"
+              echo "  <tr><td><b>Execution Duration:</b></td><td>N/A</td></tr>"
+              echo '  <tr><td colspan="2">&nbsp;</td></tr>'
+              echo "  <tr style=\"background-color:#4472C4;color:#ffffff;\"><th colspan=\"2\">Test Results</th></tr>"
+              echo '  <tr><td colspan="2" style="color:gray;">Results unavailable</td></tr>'
+              echo '</table>'
+              echo '  <tr><td colspan="2">&nbsp;</td></tr>'
+              echo 'EOF'
+            } >> $GITHUB_OUTPUT
+            echo "total=0" >> $GITHUB_OUTPUT
+            echo "passed=0" >> $GITHUB_OUTPUT
+            echo "failed=0" >> $GITHUB_OUTPUT
+            echo "flaky=0" >> $GITHUB_OUTPUT
+            echo "skipped=0" >> $GITHUB_OUTPUT
+          fi

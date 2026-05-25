@@ -1,0 +1,41 @@
+{
+    "main": "index.js",
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "description": "",
+    "devDependencies": {
+        "@eslint/js": "9.17.0",
+        "@playwright/test": "1.60.0",
+        "@stylistic/eslint-plugin-ts": "2.12.1",
+        "@types/node": "25.5.2",
+        "adm-zip": "0.5.16",
+        "cross-env": "10.1.0",
+        "dotenv": "16.6.1",
+        "eslint": "9.17.0",
+        "playwright-zephyr": "1.2.0",
+        "patch-package": "8.0.1",
+        "ts-node": "10.9.2",
+        "typescript": "5.7.3",
+        "typescript-eslint": "8.18.2"
+    },
+    "dependencies": {
+        "async-mutex": "0.5.0",
+        "browserstack-local": "1.5.12",
+    },
+    "scripts": {
+        "test:Consumer:sit:sanity": "cross-env TEST_ENV=sit npx playwright test --project=d1_Consumer -g '@sanity'",
+        "test:Consumer:sit:smoke": "cross-env TEST_ENV=sit npx playwright test --project=d1_Consumer -g '@smoke'",
+        "test:Consumer:sit:reg": "cross-env TEST_ENV=sit npx playwright test --project=d1_Consumer -g '@regression'",
+        "report:pdf": "npx ts-node tests/utils/generate-playwright-report-pdf.ts",
+        "report:zip": "npx ts-node tests/utils/generate-playwright-report-zip.ts",
+        "test:Consumer:qa:smoke": "cross-env TEST_ENV=qa npx playwright test --project=d1_Consumer -g '@smoke'",
+        "test:Consumer:qa:reg": "cross-env TEST_ENV=qa npx playwright test --project=d1_Consumer -g '@regression'",
+        "upload:browserstack:qa": "cross-env TEST_ENV=qa npx ts-node tests/utils/browserstack-upload.ts upload ./test-results/junit-report.xml Proj_REPO",
+        "test:Consumer:qa:smoke:bs": "cross-env TEST_ENV=qa npx ts-node tests/utils/browserstack-upload.ts test-and-upload \"npm run test:Consumer:qa:smoke\" \"repo-name\" \"qa\"",
+        "test:Consumer:sit:smoke:bs": "cross-env TEST_ENV=sit npx ts-node tests/utils/browserstack-upload.ts test-and-upload \"npm run test:Consumer:sit:smoke\" \"repo-name\"",
+        "test:Consumer:sit:reg:zephyr": "cross-env TEST_ENV=sit ZEPHYR_UPLOAD=true npx playwright test --project=d1_Consumer -g '@regression'",
+        "analyze:failures": "npx ts-node tests/utils/ai-failure-analyzer.ts",
+        "analyze:failures:ai": "npx ts-node tests/utils/ai-failure-analyzer.ts --openai"
+    }
+}

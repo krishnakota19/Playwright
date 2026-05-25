@@ -1,0 +1,493 @@
+name: AI Failure Analysis
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: 'Name of the test-results artifact to download'
+        required: false
+        default: 'smoke-test-results'
+        type: string
+      results_file:
+        description: 'Path to results.json inside the downloaded artifact'
+        required: false
+        default: 'test-results/results.json'
+        type: string
+      retention_days:
+        description: 'Number of days to retain the AI analysis HTML report artifact'
+        required: false
+        default: '3'
+        type: string
+    outputs:
+      failure_table:
+        description: 'Compact HTML failure table for email notification'
+        value: ${{ jobs.analyze.outputs.failure_table }}
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    outputs:
+      failure_table: ${{ steps.analyzer.outputs.failure_table }}
+    steps:
+      - name: Download test-results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: test-results
+        continue-on-error: true
+
+      - name: Run AI Failure Analyzer (inline Node.js)
+        id: analyzer
+        run: |
+          node << 'ANALYZER_EOF'
+          const fs = require('fs');
+          const path = require('path');
+
+          // ── Locate results.json ──────────────────────────────────────────
+          const candidates = [
+            'test-results/results.json',
+            'test-results/test-results/results.json',
+          ];
+          let resultsPath = null;
+          for (const c of candidates) {
+            if (fs.existsSync(c)) { resultsPath = c; break; }
+          }
+          if (!resultsPath) {
+            console.error('results.json not found — skipping analysis');
+            process.exit(0);
+          }
+          console.log('Analyzing:', resultsPath);
+
+          const data = JSON.parse(fs.readFileSync(resultsPath, 'utf-8'));
+
+          // ── Failure patterns ──────────────────────────────────────────────
+          const PATTERNS = [
+            {
+              name: 'AUTH_FAILURE',
+              patterns: [/vault token/i, /vault.*not provided/i, /login failed/i, /invalid credentials/i, /unauthorized/i, /authentication/i, /401/, /403/, /session expired/i],
+              severity: 'CRITICAL',
+              rootCause: function(m) {
+                return /vault token/i.test(m) || /vault.*not provided/i.test(m)
+                  ? 'VAULT_TOKEN env var is missing. Tests using validCredentials fixture require it to fetch credentials from HashiCorp Vault.'
+                  : 'Authentication failed. Credentials may be invalid or expired.';
+              },
+              recs: ['Set VAULT_TOKEN before running tests', 'Verify VAULT_ADDR in config/.env', 'Check user account is not locked'],
+            },
+            {
+              name: 'TIMEOUT',
+              patterns: [/timeout\s*\d+ms exceeded/i, /waiting for.*locator/i, /action timeout/i, /navigation timeout/i, /test timeout/i],
+              severity: 'HIGH',
+              rootCause: function(m) {
+                var ms = (m.match(/(\d+)ms/) || [])[1] || 'configured';
+                return 'Element/navigation timed out after ' + ms + 'ms. Selector may be stale, page slow, or env degraded.';
+              },
+              recs: ['Check env availability', 'Verify selector is still valid', 'Inspect failure screenshot', 'Consider increasing actionTimeout'],
+            },
+            {
+              name: 'LOCATOR_NOT_FOUND',
+              patterns: [/locator.*not found/i, /no element matching/i, /strict mode violation/i, /resolved to \d+ element/i],
+              severity: 'HIGH',
+              rootCause: function(m) {
+                return /strict mode/i.test(m)
+                  ? 'Strict mode violation: locator matched multiple elements.'
+                  : 'Element not found in DOM. Selector may be outdated after a UI change.';
+              },
+              recs: ['Open trace/screenshot to inspect DOM', 'Verify selector against current HTML', 'Ensure test preconditions are met'],
+            },
+            {
+              name: 'ASSERTION_FAILURE',
+              patterns: [/expect\(received\)/i, /expected.*received/i, /toBe|toEqual|toContain|toHaveText|toBeVisible/i, /AssertionError/i],
+              severity: 'MEDIUM',
+              rootCause: function(m) {
+                var exp = (m.match(/Expected[:\s]+"?([^"\n]+)"?/i) || [])[1];
+                var rec = (m.match(/Received[:\s]+"?([^"\n]+)"?/i) || [])[1];
+                return exp && rec
+                  ? 'Assertion mismatch — Expected: "' + exp.trim() + '" but got: "' + rec.trim() + '"'
+                  : 'Actual value did not match expected. Possible functional regression or stale test data.';
+              },
+              recs: ['Check expected vs received in error', 'Verify test data in testData.json is current', 'Review last PASS screenshot vs failure'],
+            },
+            {
+              name: 'NAVIGATION_ERROR',
+              patterns: [/net::ERR_/i, /ERR_CONNECTION_REFUSED/i, /Failed to navigate/i, /ECONNREFUSED/i],
+              severity: 'CRITICAL',
+              rootCause: function() { return 'Navigation failed. Environment may be down or URL incorrect.'; },
+              recs: ['Verify BASE_URL / environment config', 'Check environment is running', 'Test URL manually'],
+            },
+            {
+              name: 'ELEMENT_NOT_VISIBLE',
+              patterns: [/element is not visible/i, /element is hidden/i, /not visible on the screen/i],
+              severity: 'HIGH',
+              rootCause: function() { return 'Target element is present in DOM but not visible/interactive.'; },
+              recs: ['Check if element is behind a loader or overlay', 'Verify element is scrolled into view', 'Ensure any prerequisite steps were completed'],
+            },
+            {
+              name: 'PAGE_CRASH',
+              patterns: [/page crashed/i, /target closed/i, /execution context was destroyed/i],
+              severity: 'CRITICAL',
+              rootCause: function() { return 'Browser page/context crashed. Possible JS error on page or memory pressure.'; },
+              recs: ['Check browser console errors in trace', 'Run npx playwright install to update browsers', 'Verify app has no JS errors'],
+            },
+            {
+              name: 'ELEMENT_NOT_ENABLED',
+              patterns: [/element is not enabled/i, /element.*disabled|is disabled/i, /not interactable/i],
+              severity: 'MEDIUM',
+              rootCause: function() { return 'Element is present and visible but disabled. Pre-conditions to enable it may not be met.'; },
+              recs: ['Verify required form fields/steps before this element are completed', 'Check if enable/disable logic is data-driven', 'Inspect application state in failure screenshot'],
+            },
+            {
+              name: 'NETWORK_ERROR',
+              patterns: [/request failed/i, /fetch failed/i, /api.*error/i, /500 internal server/i, /502 bad gateway/i, /503 service unavailable/i],
+              severity: 'HIGH',
+              rootCause: function() { return 'A network request returned an error. Backend API may be down or endpoint may be invalid.'; },
+              recs: ['Check browser network logs in Playwright traces', 'Verify backend services are healthy', 'Review recent deployments for API contract changes'],
+            },
+            {
+              name: 'STEP_FAILURE',
+              patterns: [/FAIL\s*-/i, /step.*failed/i, /Report\.fail/i],
+              severity: 'HIGH',
+              rootCause: function() { return 'A custom test step explicitly reported a failure via Report.fail(). This is a functional test failure.'; },
+              recs: ['Review failing step message for details', 'Check attached screenshot for the FAIL step', 'Cross-check with manual testing to confirm if real defect or test data issue'],
+            },
+          ];
+
+          function categorize(msg, stack) {
+            var txt = msg + '\n' + stack;
+            for (var i = 0; i < PATTERNS.length; i++) {
+              var p = PATTERNS[i];
+              for (var j = 0; j < p.patterns.length; j++) {
+                if (p.patterns[j].test(txt)) return p;
+              }
+            }
+            return {
+              name: 'UNKNOWN',
+              severity: 'MEDIUM',
+              rootCause: function() { return 'No pattern matched. Manual investigation required.'; },
+              recs: ['Review full error and stack trace', 'Check latest screenshot'],
+            };
+          }
+
+          function cleanStepText(s) {
+            return String(s || '').replace(/\s+/g, ' ').trim();
+          }
+
+          function quoteText(s, maxLen) {
+            var val = cleanStepText(s);
+            if (!val) return '';
+            if (val.length > maxLen) val = val.slice(0, maxLen - 3) + '...';
+            return '"' + val + '"';
+          }
+
+          function pickBusinessStackStep(txt) {
+            var re = /at\s+([^\s\(]+)\s+\(([^\)]+)\)/g;
+            var m;
+            while ((m = re.exec(txt)) !== null) {
+              var fn = m[1] || '';
+              var loc = m[2] || '';
+              var lower = (fn + ' ' + loc).toLowerCase();
+              if (
+                lower.indexOf('tests\\utils\\reporter.ts') >= 0 ||
+                lower.indexOf('function.log') >= 0 ||
+                lower.indexOf('function.fail') >= 0
+              ) {
+                continue;
+              }
+
+              var locMatch = loc.match(/([^\\\/]+\.ts:\d+(?::\d+)?)/);
+              var shortLoc = locMatch ? locMatch[1] : loc;
+              return {
+                fn: fn,
+                loc: shortLoc,
+              };
+            }
+            return null;
+          }
+
+          function extractFailureContext(msg, stack, category) {
+            var txt = String(msg || '') + '\n' + String(stack || '');
+
+            // Prefer Playwright call log line if available.
+            var callLogMatch = txt.match(/-\s+(waiting for|locator\.|click|fill|press|check|uncheck|hover|selectOption|dblclick|tap|goto|navigate)[^\n]*/i);
+            if (callLogMatch && callLogMatch[0]) {
+              return 'Failure step: ' + cleanStepText(callLogMatch[0].replace(/^-\s*/, '')) + '.';
+            }
+
+            var waitingFor = txt.match(/waiting for\s+([^\n]+)/i);
+            if (waitingFor && waitingFor[1]) {
+              return 'Failure step: waiting for ' + quoteText(waitingFor[1], 160) + '.';
+            }
+
+            var locatorMatch = txt.match(/locator\(([^\n\)]+)\)/i);
+            if (locatorMatch && locatorMatch[1]) {
+              var locatorText = quoteText(locatorMatch[1], 160);
+              if (category === 'TIMEOUT') return 'Failure step: timeout while identifying locator ' + locatorText + '.';
+              if (category === 'LOCATOR_NOT_FOUND') return 'Failure step: failed to locate element using locator ' + locatorText + '.';
+              return 'Failure step: locator interaction failed for ' + locatorText + '.';
+            }
+
+            var actionMatch = txt.match(/\b(click|fill|type|press|check|uncheck|hover|selectOption|goto|navigate)\b/i);
+            if (actionMatch && actionMatch[1]) {
+              return 'Failure step: action ' + quoteText(actionMatch[1], 40) + ' failed during execution.';
+            }
+
+            var stepMsg = txt.match(/Error:\s*([^\n]+)/i);
+            var businessStep = pickBusinessStackStep(txt);
+            if (businessStep) {
+              if (stepMsg && stepMsg[1]) {
+                return 'Failure step: ' + quoteText(stepMsg[1], 120) + ' in ' + quoteText(businessStep.fn + ' (' + businessStep.loc + ')', 140) + '.';
+              }
+              return 'Failure step: ' + quoteText(businessStep.fn + ' (' + businessStep.loc + ')', 140) + ' failed.';
+            }
+
+            return '';
+          }
+
+          // ── Collect failures ──────────────────────────────────────────────
+          function collectFailed(suite, file) {
+            var results = [];
+            var f = suite.file || file || suite.title || '';
+            if (suite.specs) {
+              for (var i = 0; i < suite.specs.length; i++) {
+                var spec = suite.specs[i];
+                if (spec.ok === false || spec.ok === undefined) {
+                  var tests = spec.tests || [];
+                  for (var j = 0; j < tests.length; j++) {
+                    var t = tests[j];
+                    var hasFailResult = (t.results || []).some(function(r) { return r.status === 'failed'; });
+                    if (t.status === 'unexpected' || hasFailResult) {
+                      results.push({ title: spec.title || 'Unknown', file: f, projectName: t.projectName || '', results: t.results || [], tags: t.tags || [] });
+                    }
+                  }
+                }
+              }
+            }
+            if (suite.suites) {
+              for (var k = 0; k < suite.suites.length; k++) {
+                var sub = collectFailed(suite.suites[k], f);
+                for (var m = 0; m < sub.length; m++) results.push(sub[m]);
+              }
+            }
+            return results;
+          }
+
+          var failed = [];
+          var suites = data.suites || [];
+          for (var si = 0; si < suites.length; si++) {
+            var found = collectFailed(suites[si], suites[si].file || suites[si].title);
+            for (var fi = 0; fi < found.length; fi++) failed.push(found[fi]);
+          }
+
+          var stats = data.stats || {};
+          var totalFailed = stats.unexpected || failed.length;
+          var totalPassed = stats.expected || 0;
+          var totalSkipped = stats.skipped || 0;
+          var totalFlaky = stats.flaky || 0;
+          var dur = stats.duration || 0;
+          var runDuration = Math.floor(dur/60000) + 'm ' + ((dur%60000)/1000).toFixed(1) + 's';
+          var runDate = stats.startTime ? new Date(stats.startTime).toLocaleString() : new Date().toLocaleString();
+
+          // ── Build analyzed failures ───────────────────────────────────────
+          var catBreakdown = {};
+          var sevBreakdown = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+          var fileMap = {};
+          var analyzed = [];
+
+          for (var ai = 0; ai < failed.length; ai++) {
+            var t = failed[ai];
+            var lastResult = t.results[t.results.length - 1] || {};
+            var err = (lastResult.errors || [])[0] || {};
+            var msg = (err.message || 'No error message').replace(/\x1b\[[0-9;]*m/g, '');
+            var stk = (err.stack || '').replace(/\x1b\[[0-9;]*m/g, '');
+            var rule = categorize(msg, stk);
+            var stepContext = extractFailureContext(msg, stk, rule.name);
+            var baseRootCause = rule.rootCause(msg);
+            catBreakdown[rule.name] = (catBreakdown[rule.name] || 0) + 1;
+            if (sevBreakdown[rule.severity] !== undefined) sevBreakdown[rule.severity]++;
+            var relFile = t.file || 'unknown';
+            var baseFile = path.basename(relFile);
+            fileMap[baseFile] = (fileMap[baseFile] || 0) + 1;
+            analyzed.push({
+              title: t.title,
+              file: baseFile,
+              project: t.projectName,
+              duration: lastResult.duration || 0,
+              retries: t.results.length - 1,
+              category: rule.name,
+              severity: rule.severity,
+              errorMessage: msg.split('\n')[0].slice(0, 200),
+              rootCause: stepContext ? (baseRootCause + ' ' + stepContext) : baseRootCause,
+              recs: rule.recs,
+              tags: t.tags,
+            });
+          }
+
+          var passRate = ((totalPassed / Math.max(totalPassed + totalFailed + totalSkipped, 1)) * 100).toFixed(1);
+
+          // ── HTML report ───────────────────────────────────────────────────
+          function esc(s) {
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+          }
+          var sevColor = { CRITICAL:'#dc2626', HIGH:'#ea580c', MEDIUM:'#d97706', LOW:'#65a30d' };
+          var catColor = { AUTH_FAILURE:'#dc2626', TIMEOUT:'#7c3aed', LOCATOR_NOT_FOUND:'#db2777', ASSERTION_FAILURE:'#0369a1', NAVIGATION_ERROR:'#b91c1c', PAGE_CRASH:'#7f1d1d', ELEMENT_NOT_VISIBLE:'#0891b2', UNKNOWN:'#6b7280' };
+
+          function badge(label, color) {
+            return '<span style="display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700;color:#fff;background:' + color + ';text-transform:uppercase;letter-spacing:.05em">' + label + '</span>';
+          }
+
+          var catKeys = Object.keys(catBreakdown);
+          var maxCat = 1;
+          for (var ci = 0; ci < catKeys.length; ci++) { if (catBreakdown[catKeys[ci]] > maxCat) maxCat = catBreakdown[catKeys[ci]]; }
+
+          var catBars = '';
+          for (var ci2 = 0; ci2 < catKeys.length; ci2++) {
+            var k = catKeys[ci2]; var v = catBreakdown[k];
+            catBars += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:13px">' +
+              '<span style="width:180px;color:#cbd5e1">' + k.replace(/_/g,' ') + '</span>' +
+              '<div style="flex:1;height:8px;background:#334155;border-radius:4px;overflow:hidden"><div style="height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);border-radius:4px;width:' + Math.round(v/maxCat*100) + '%"></div></div>' +
+              '<span style="color:#94a3b8;font-weight:600;width:20px;text-align:right">' + v + '</span></div>';
+          }
+
+          var sevKeys = ['CRITICAL','HIGH','MEDIUM','LOW'];
+          var sevBlocks = '';
+          for (var si2 = 0; si2 < sevKeys.length; si2++) {
+            var sk = sevKeys[si2];
+            sevBlocks += '<div style="display:flex;justify-content:space-between;align-items:center;background:#0f172a;border-radius:8px;padding:10px 14px;margin-bottom:8px">' +
+              '<span style="font-size:13px;font-weight:600;color:' + (sevColor[sk]||'#6b7280') + '">' + sk + '</span>' +
+              '<span style="font-size:24px;font-weight:800;color:' + (sevColor[sk]||'#6b7280') + '">' + sevBreakdown[sk] + '</span></div>';
+          }
+
+          var topFiles = Object.keys(fileMap).sort(function(a,b){ return fileMap[b]-fileMap[a]; }).slice(0,8);
+          var topFilesHtml = '';
+          if (topFiles.length > 1) {
+            topFilesHtml = '<div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.1em;margin:14px 0 8px">Top Failing Files</div>';
+            for (var tf = 0; tf < topFiles.length; tf++) {
+              topFilesHtml += '<div style="display:flex;justify-content:space-between;font-size:12px;color:#94a3b8;margin-bottom:4px"><span>' + esc(path.basename(topFiles[tf])) + '</span><span style="font-weight:700">' + fileMap[topFiles[tf]] + '</span></div>';
+            }
+          }
+
+          var statCards = [
+            ['Passed', totalPassed, '#4ade80'],
+            ['Failed', totalFailed, '#f87171'],
+            ['Flaky', totalFlaky, '#facc15'],
+            ['Skipped', totalSkipped, '#94a3b8'],
+            ['Pass Rate', passRate + '%', '#60a5fa'],
+          ];
+          var statHtml = '';
+          for (var sc = 0; sc < statCards.length; sc++) {
+            statHtml += '<div style="background:#1e293b;border-radius:10px;padding:18px;text-align:center;border:1px solid #334155"><div style="font-size:32px;font-weight:800;color:' + statCards[sc][2] + '">' + statCards[sc][1] + '</div><div style="font-size:12px;color:#94a3b8;margin-top:4px;text-transform:uppercase;letter-spacing:.05em">' + statCards[sc][0] + '</div></div>';
+          }
+
+          var failCards = '';
+          for (var fc = 0; fc < analyzed.length; fc++) {
+            var f2 = analyzed[fc];
+            var recsHtml = '';
+            for (var ri = 0; ri < f2.recs.length; ri++) recsHtml += '<li style="margin-bottom:4px">' + esc(f2.recs[ri]) + '</li>';
+            var tagsHtml = f2.tags && f2.tags.length ? '<span>Tags: ' + esc(f2.tags.join(', ')) + '</span>' : '';
+            failCards += '<div style="background:#1e293b;border-radius:12px;border-left:4px solid ' + (sevColor[f2.severity]||'#6b7280') + ';border:1px solid #334155;margin-bottom:20px;overflow:hidden">' +
+              '<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:20px 24px 10px;flex-wrap:wrap;gap:8px">' +
+                '<div style="display:flex;align-items:center;gap:10px">' +
+                  '<span style="background:#334155;color:#94a3b8;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0">' + (fc+1) + '</span>' +
+                  '<span style="font-size:15px;font-weight:700;color:#e2e8f0">' + esc(f2.title) + '</span>' +
+                '</div>' +
+                '<div style="display:flex;gap:6px;flex-wrap:wrap">' + badge(f2.category.replace(/_/g,' '), catColor[f2.category]||'#6b7280') + ' ' + badge(f2.severity, sevColor[f2.severity]||'#6b7280') + '</div>' +
+              '</div>' +
+              '<div style="padding:0 24px 10px;font-size:12px;color:#64748b;display:flex;flex-wrap:wrap;gap:14px">' +
+                '<span>File: ' + esc(f2.file) + '</span><span>Project: ' + esc(f2.project) + '</span><span>Duration: ' + (f2.duration/1000).toFixed(1) + 's</span><span>Retries: ' + f2.retries + ' retr' + (f2.retries===1?'y':'ies') + '</span>' + tagsHtml +
+              '</div>' +
+              '<div style="margin:0 24px 6px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.1em">Error</div>' +
+              '<pre style="margin:0 24px 10px;padding:10px 14px;background:#1a0a0a;border-radius:8px;font-size:12px;color:#fca5a5;white-space:pre-wrap;word-break:break-word;border:1px solid #3b1010;font-family:monospace">' + esc(f2.errorMessage) + '</pre>' +
+              '<div style="margin:0 24px 6px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.1em">Root Cause</div>' +
+              '<p style="margin:0 24px 10px;padding:10px 14px;background:#0c1445;border-radius:8px;font-size:13px;color:#93c5fd;border-left:3px solid #3b82f6">' + esc(f2.rootCause) + '</p>' +
+              '<div style="margin:0 24px 6px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.1em">Recommendations</div>' +
+              '<ol style="margin:0 24px 16px;padding-left:22px;font-size:13px;color:#cbd5e1">' + recsHtml + '</ol>' +
+            '</div>';
+          }
+
+          var mainContent = totalFailed === 0
+            ? '<div style="text-align:center;padding:40px;color:#4ade80;font-size:20px;font-weight:700">All tests passed - no failures to analyze.</div>'
+            : '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:28px">' +
+                '<div style="background:#1e293b;border-radius:10px;padding:20px;border:1px solid #334155">' +
+                  '<div style="font-size:16px;font-weight:700;color:#93c5fd;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #1e40af">Failure Categories</div>' +
+                  catBars +
+                '</div>' +
+                '<div style="background:#1e293b;border-radius:10px;padding:20px;border:1px solid #334155">' +
+                  '<div style="font-size:16px;font-weight:700;color:#93c5fd;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #1e40af">Severity Distribution</div>' +
+                  sevBlocks + topFilesHtml +
+                '</div>' +
+              '</div>' +
+              '<div style="font-size:17px;font-weight:700;color:#93c5fd;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #1e40af">Failure Details (' + totalFailed + ')</div>' +
+              failCards;
+
+          var html = '<!DOCTYPE html>\n<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Failure Analysis - MidFirst Playwright</title></head>\n' +
+            '<body style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:0">\n' +
+            '<div style="background:linear-gradient(135deg,#1e3a5f,#0c1445);padding:32px 48px;border-bottom:1px solid #1e40af">\n' +
+            '  <h1 style="font-size:26px;font-weight:700;color:#60a5fa;margin:0 0 4px">AI Failure Analyzer</h1>\n' +
+            '  <div style="color:#94a3b8;font-size:14px">MidFirst Playwright Automation - Intelligent Test Failure Analysis</div>\n' +
+            '  <div style="display:flex;gap:32px;margin-top:12px;font-size:13px;color:#94a3b8"><span>Date: ' + esc(runDate) + '</span><span>Duration: ' + esc(runDuration) + '</span></div>\n' +
+            '</div>\n' +
+            '<div style="max-width:1100px;margin:0 auto;padding:32px 24px">\n' +
+            '  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:28px">' + statHtml + '</div>\n' +
+            mainContent +
+            '\n</div>\n' +
+            '<div style="text-align:center;padding:20px;color:#334155;font-size:12px;border-top:1px solid #1e293b">Generated by AI Failure Analyzer | MidFirst Playwright | ' + new Date().toLocaleString() + '</div>' +
+            '</body></html>';
+
+          var outPath = 'test-results/ai-failure-analysis.html';
+          fs.mkdirSync('test-results', { recursive: true });
+          fs.writeFileSync(outPath, html, 'utf-8');
+          console.log('\n✅ AI Failure Analysis Report saved: ' + outPath);
+          console.log('   Passed: ' + totalPassed + ' | Failed: ' + totalFailed + ' | Flaky: ' + totalFlaky + ' | Skipped: ' + totalSkipped);
+          if (analyzed.length > 0) {
+            var cats = Object.keys(catBreakdown).map(function(k){ return k + '(' + catBreakdown[k] + ')'; }).join(', ');
+            console.log('   Categories: ' + cats);
+          }
+
+          // ── Compact failure table for email notification ───────────────
+          var emailTable = '';
+          if (analyzed.length > 0) {
+            var sevBg = { CRITICAL:'#fecaca', HIGH:'#fed7aa', MEDIUM:'#fef9c3', LOW:'#d1fae5' };
+            var sevFg = { CRITICAL:'#991b1b', HIGH:'#9a3412', MEDIUM:'#854d0e', LOW:'#166534' };
+            var maxRows = 15;
+            var rows = '';
+            var shown = Math.min(analyzed.length, maxRows);
+            for (var ei = 0; ei < shown; ei++) {
+              var e = analyzed[ei];
+              var bg = ei % 2 === 0 ? '#ffffff' : '#f8fafc';
+              rows += '<tr style="background:' + bg + ';border:2px solid #b91c1c;">' +
+                '<td style="padding:6px 10px;border:1px solid #e2e8f0;text-align:center;font-size:12px;color:#64748b;">' + (ei+1) + '</td>' +
+                '<td style="padding:6px 10px;border:1px solid #e2e8f0;font-size:12px;">' + esc(e.title) + '</td>' +
+                '<td style="padding:6px 10px;border:1px solid #e2e8f0;font-size:12px;">' + esc(e.file) + '</td>' +
+                '<td style="padding:6px 10px;border:1px solid #e2e8f0;font-size:11px;text-align:center;white-space:nowrap;">' + esc(e.category.replace(/_/g, ' ')) + '</td>' +
+                '<td style="padding:6px 10px;border:1px solid #e2e8f0;font-size:12px;color:#475569;">' + esc(e.rootCause) + '</td>' +
+              '</tr>';
+            }
+            if (analyzed.length > maxRows) {
+              rows += '<tr style="background:#f1f5f9;"><td colspan="5" style="padding:8px 10px;border:1px solid #e2e8f0;text-align:center;font-size:12px;color:#64748b;font-style:italic;">... and ' + (analyzed.length - maxRows) + ' more failure(s). See full AI Failure Analysis report for details.</td></tr>';
+            }
+            emailTable = '<br><b style="font-size:14px;">❌ Failure Analysis (' + analyzed.length + ' failure' + (analyzed.length > 1 ? 's' : '') + ')</b><br><br>' +
+              '<table border="1" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-family:Arial,sans-serif;width:100%;max-width:900px;">' +
+              '<tr style="background-color:#dc2626;color:#ffffff;">' +
+                '<th style="padding:8px 10px;border:1px solid #b91c1c;font-size:12px;width:30px;">#</th>' +
+                '<th style="padding:8px 10px;border:1px solid #b91c1c;font-size:12px;">Test Name</th>' +
+                '<th style="padding:8px 10px;border:1px solid #b91c1c;font-size:12px;">File</th>' +
+                '<th style="padding:8px 10px;border:1px solid #b91c1c;font-size:12px;">Category</th>' +
+                '<th style="padding:8px 10px;border:1px solid #b91c1c;font-size:12px;">Root Cause</th>' +
+              '</tr>' +
+              rows +
+              '</table><br>';
+          }
+
+          // Write the failure table to GITHUB_OUTPUT using delimiter syntax
+          var delimiter = 'FAILURE_TABLE_' + Date.now();
+          var outputContent = 'failure_table<<' + delimiter + '\n' + emailTable + '\n' + delimiter + '\n';
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, outputContent, 'utf-8');
+          console.log('📧 Failure table for email: ' + (emailTable ? analyzed.length + ' failures included' : 'No failures'));
+          ANALYZER_EOF
+        continue-on-error: true
+
+      - name: Upload AI Failure Analysis Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-failure-analysis
+          path: test-results/ai-failure-analysis.html
+          retention-days: ${{ inputs.retention_days }}

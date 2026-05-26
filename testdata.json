@@ -1,0 +1,14 @@
+{
+  "OLBSmokeLogin": {
+    "userID": "DDAandNOWqa01",
+    "last4DigitOfAcctNum": "3339",
+  },
+  "OLBMainMenuOptions": {
+    "TransferMenu": "Move Money:Transfer",
+    "SettingsMenu": "More:Settings",
+  },
+  "tdata_Common": {
+    "AcctNickTab":"Account Nicknames",
+    "ActivityTab":"Activity"
+  }
+}

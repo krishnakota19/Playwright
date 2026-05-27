@@ -83,6 +83,7 @@ export class TransferPage {
     readonly totalRecordsText:Locator;
     readonly noSceduledTransactionsMsg:Locator;
     readonly amountExceedErrorMsg:Locator;
+    readonly VerifyRegularPaymentOption:Locator;
 
 
     constructor(page: Page) {
@@ -155,6 +156,7 @@ export class TransferPage {
         this.totalRecordsText= page.locator('xpath=//li[@class="totalcount disabled basiccount"]//a');
         this.noSceduledTransactionsMsg= page.locator('xpath=//span[text()="There are no scheduled transactions."]');
         this.amountExceedErrorMsg = page.locator('xpath=//p[@class="help-block text-danger"]//span');
+        this.VerifyRegularPaymentOption = page.locator('input[type="radio"][aria-label="Recurring Transfer"]');
    
     }
 
@@ -328,7 +330,7 @@ export class TransferPage {
     }
 }
 
-async SelectFromAccountLoanActsandGetAvailableBalance(FromaccountNumber: string): Promise<string | null> {
+async SelectFromAccountLoanActsandGetAvailableCredit(FromaccountNumber: string): Promise<string | null> {
     try {
         const optionLocator = `${this.Fromaccountdropdown} option:has-text("${FromaccountNumber}")`;
         const optionElement = await this.page.locator(optionLocator).elementHandle();
@@ -355,6 +357,7 @@ async SelectFromAccountLoanActsandGetAvailableBalance(FromaccountNumber: string)
 
     async SelectToAccount(ToAccountNumber: string) {
         try {
+            await waitForSpinnerToClose(this.page);
             const optionLocator = `${this.Toaccountdropdown} option:has-text("${ToAccountNumber}")`;
             const optionElement = await this.page.locator(optionLocator).elementHandle();
             const optionValue = await optionElement?.getAttribute('value');
@@ -415,14 +418,14 @@ async SelectFromAccountLoanActsandGetAvailableBalance(FromaccountNumber: string)
      */
     async EnterAmountValue(input: { AvailableBal?: string | null, CurrentBal?: string | null , AvailableCredit?: string | null }) {
         try {
-            let availNum = 0, currNum = 0;
-            if (input.AvailableBal) availNum = parseFloat(input.AvailableBal.replace(/,/g, ""));
+            let availBalNum = 0, currNum = 0, availCreditNum = 0;
+            if (input.AvailableBal) availBalNum = parseFloat(input.AvailableBal.replace(/,/g, ""));
             if (input.CurrentBal) currNum = parseFloat(input.CurrentBal.replace(/,/g, ""));
-            if (input.AvailableCredit) availNum = parseFloat(input.AvailableCredit.replace(/,/g, ""));
+            if (input.AvailableCredit) availCreditNum = parseFloat(input.AvailableCredit.replace(/,/g, ""));
 
             // 1) Validate inline error for available balance exceeded
-            if (availNum > 0) {
-                const amountExceedAvail = (availNum + 1).toFixed(2);
+            if (availBalNum > 0) {
+                const amountExceedAvail = (availBalNum + 1).toFixed(2);
                 await this.amountField.fill(amountExceedAvail);
                 await this.page.keyboard.press('Tab');
                 const errorMsg = await this.amountExceedErrorMsg.textContent();
@@ -446,8 +449,8 @@ async SelectFromAccountLoanActsandGetAvailableBalance(FromaccountNumber: string)
                 }
             }
             // 3) If AvailableCredit is provided, validate inline error for credit limit exceeded
-            if (input.AvailableCredit) {
-                const amountExceedCredit = (availNum + 1).toFixed(2);
+            if (availCreditNum > 0) {
+                const amountExceedCredit = (availCreditNum + 1).toFixed(2);
                 await this.amountField.fill(amountExceedCredit);
                 await this.page.keyboard.press('Tab');
                 const errorMsg = await this.amountExceedErrorMsg.textContent(); 
@@ -1219,6 +1222,15 @@ async SelectFromAccountLoanActsandGetAvailableBalance(FromaccountNumber: string)
         }
     }
 
+    async VerifyRegularPaymentOptionSelected(){
+        const recurringRadio = this.VerifyRegularPaymentOption;
+            if (!(await recurringRadio.isChecked())) {
+            await Report.info(this.page, '"Recurring Transfer" radio button is not selected by default');
+            await recurringRadio.click();
+        }else{
+            await Report.pass(this.page, '"Recurring Transfer" radio button is selected by default');
+        }
+    }
 
 
   

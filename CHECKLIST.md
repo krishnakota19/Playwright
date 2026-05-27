@@ -1,4 +1,4 @@
-# ✅ Project Setup Checklist
+# ✅ Project Setup Checklist**
 
 ## Installation Status
 
